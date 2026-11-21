@@ -1,267 +1,136 @@
-use std::convert::Infallible;
-use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::path::PathBuf;
+use std::sync::LazyLock;
 
-use crate::slam3_orb::{InterpolationFlags, Slam3ORB};
+use clap::{Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
-use once_cell::sync::Lazy;
-use opencv::{core, features2d, flann};
-use structopt::clap::AppSettings;
-use structopt::StructOpt;
+use opencv::imgproc::InterpolationFlags;
 
-static CONF_DIR: Lazy<ConfDir> = Lazy::new(|| {
+use crate::cli::*;
+
+static CONF_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     let proj_dirs = ProjectDirs::from("", "aloxaf", "imsearch").expect("failed to get project dir");
-    ConfDir(proj_dirs.config_dir().to_path_buf())
+    proj_dirs.config_dir().to_path_buf()
 });
 
 fn default_config_dir() -> &'static str {
-    CONF_DIR.path().to_str().unwrap()
+    CONF_DIR.to_str().unwrap()
 }
 
-#[derive(StructOpt, Debug, Clone)]
-#[structopt(name = "imsearch", global_setting(AppSettings::ColoredHelp))]
-pub struct Opts {
-    /// Path to imsearch config
-    #[structopt(short, long, default_value = default_config_dir())]
-    pub conf_dir: ConfDir,
-
-    /// The maximum number of features to retain
-    #[structopt(short = "n", value_name = "N", long, default_value = "500")]
+#[derive(Parser, Debug, Clone)]
+pub struct OrbOptions {
+    /// ORB 特征点最大保留数量
+    #[arg(short = 'n', value_name = "N", long, default_value_t = 500)]
     pub orb_nfeatures: u32,
-    /// Pyramid decimation ratio, greater than 1
-    #[structopt(long, value_name = "SCALE", default_value = "1.2")]
+    /// ORB 特征金字塔缩放因子
+    #[arg(long, value_name = "SCALE", default_value_t = 1.2)]
     pub orb_scale_factor: f32,
-    /// The number of pyramid levels
-    #[structopt(long, value_name = "N", default_value = "8")]
+    /// ORB 特征金字塔层数
+    #[arg(long, value_name = "N", default_value_t = 8)]
     pub orb_nlevels: u32,
-    /// Initial fast threshold
-    #[structopt(long, value_name = "THRESHOLD", default_value = "20")]
-    pub orb_ini_th_fast: u32,
-    /// Minimum fast threshold
-    #[structopt(long, value_name = "THRESHOLD", default_value = "7")]
-    pub orb_min_th_fast: u32,
-    /// Interpolation algorithm
-    #[structopt(long, value_name = "FLAG", default_value = "Liner")]
+    /// ORB 特征点金字塔缩放插值方式
+    #[arg(long, value_name = "FLAG", default_value = "area", value_parser = parse_interpolation)]
     pub orb_interpolation: InterpolationFlags,
-    /// Record orientation info
-    #[structopt(long)]
+    /// ORB FAST 角点检测器初始阈值
+    #[arg(long, value_name = "THRESHOLD", default_value_t = 20)]
+    pub orb_ini_th_fast: u32,
+    /// ORB FAST 角点检测器最小阈值
+    #[arg(long, value_name = "THRESHOLD", default_value_t = 7)]
+    pub orb_min_th_fast: u32,
+    /// ORB 特征点是否不需要方向信息
+    #[arg(long)]
     pub orb_not_oriented: bool,
+    /// 图片最大尺寸，如果宽高**均**超过这个尺寸，则等比缩放
+    #[arg(short = 'S', long, value_name = "HEIGHTxWIDHT", value_parser = parse_size, verbatim_doc_comment, default_value = "1080x768")]
+    pub max_size: (i32, i32),
+    /// 图片最大长宽比例，超过这个比例的图片，会按比例增加特征点数量
+    #[arg(short = 'A', long, value_name = "RATIO", default_value_t = 5.)]
+    pub max_aspect_ratio: f32,
+    /// 最大特征点数量
+    #[arg(long, default_value_t = 1000)]
+    pub max_features: u32,
+}
 
-    /// Use mmap instead of read whole index to memory
-    #[structopt(long)]
-    pub mmap: bool,
-
-    /// Number of features to search per iteration
-    #[structopt(long, value_name = "SIZE", default_value = "5000000")]
-    pub batch_size: usize,
-    /// Maximum distance allowed for match, from 0 ~ 255
-    #[structopt(long, value_name = "N", default_value = "64")]
+#[derive(Parser, Debug, Clone)]
+pub struct SearchOptions {
+    /// 两个相似向量的允许的最大距离，范围从 0 到 255
+    #[arg(long, value_name = "N", default_value_t = 64, value_parser = clap::value_parser!(u32).range(0..=255))]
     pub distance: u32,
-
-    /// How to calculate the score
-    #[structopt(long, value_name = "TYPE", default_value = "wilson", possible_values = &["wilson", "count"])]
-    pub score_type: ScoreType,
-    /// How many results to show
-    #[structopt(long, value_name = "COUNT", default_value = "10")]
-    pub output_count: usize,
-    /// Output format
-    #[structopt(long, value_name = "FORMAT", default_value = "table", possible_values = &["table", "json"])]
-    pub output_format: OutputFormat,
-    /// Count of best matches found per each query descriptor
-    #[structopt(long, value_name = "K", default_value = "3")]
-    pub knn_k: usize,
-    /// How many bucket to search
-    #[structopt(long, value_name = "N", default_value = "3")]
+    /// 显示的结果数量
+    #[arg(long, value_name = "COUNT", default_value_t = 10)]
+    pub count: usize,
+    /// 每个查询描述符找到的最佳匹配数量
+    #[arg(short, value_name = "K", default_value_t = 3)]
+    pub k: usize,
+    /// 搜索的倒排列表数量
+    #[arg(long, default_value = "3")]
     pub nprobe: usize,
+    /// 评分方式
+    #[arg(long, value_enum, default_value_t = ScoreType::Wilson)]
+    pub score_type: ScoreType,
+    /// 倒排列表读取线程（默认为 CPU 核心数）
+    #[arg(short, long, default_value_t = num_cpus::get())]
+    pub threads: usize,
+}
 
-    #[structopt(subcommand)]
+fn long_version() -> &'static str {
+    concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("VERGEN_GIT_SHA"),
+        " ",
+        env!("VERGEN_BUILD_DATE"),
+        ")"
+    )
+}
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "imsearch", version, long_version = long_version())]
+pub struct Opts {
+    #[command(subcommand)]
     pub subcmd: SubCommand,
+    /// imsearch 配置文件目录
+    #[arg(short, long, default_value = default_config_dir())]
+    pub conf_dir: PathBuf,
 }
 
-#[derive(StructOpt, Debug, Clone)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum SubCommand {
-    /// Show all features point for an image
-    ShowKeypoints(ShowKeypoints),
-    /// Show matches between two image
-    ShowMatches(ShowMatches),
-    /// Add images to database
-    AddImages(AddImages),
-    /// Search image from database
-    SearchImage(SearchImage),
-    /// Start interactive REPL
-    StartRepl(StartRepl),
-    /// Start Web server
-    StartServer(StartServer),
-    /// Build index
-    BuildIndex(BuildIndex),
-    /// Clear indexed (and unindexed) features
-    ClearCache(ClearCache),
-    /// Mark a range of features as trained
-    MarkAsIndexed(MarkAsIndexed),
-    /// Export data for trainning
-    ExportData,
+    /// 添加图片特征点到数据库
+    Add(AddCommand),
+    /// 从数据库中搜索图片
+    Search(SearchCommand),
+    /// 启动 HTTP 搜索服务
+    Server(ServerCommand),
+    /// 使用已添加的特征点构建索引
+    Build(BuildCommand),
+    /// 清理数据库中的特征点，主要作用为减小数据库体积
+    Clean(CleanCommand),
+    /// 训练索引
+    Train(TrainCommand),
 }
 
-#[derive(StructOpt, Debug, Clone)]
-pub struct ShowKeypoints {
-    /// Path to an image
-    pub image: String,
-    /// Optional output image
-    pub output: Option<String>,
+fn parse_size(s: &str) -> anyhow::Result<(i32, i32)> {
+    let parts: Vec<&str> = s.split('x').collect();
+    if parts.len() != 2 {
+        return Err(anyhow::anyhow!("无效的尺寸: {s}"));
+    }
+    Ok((parts[0].parse()?, parts[1].parse()?))
 }
 
-#[derive(StructOpt, Debug, Clone)]
-pub struct ShowMatches {
-    /// Path to image A
-    pub image1: String,
-    /// Path to image B
-    pub image2: String,
-    /// Optional output image
-    pub output: Option<String>,
+fn parse_interpolation(s: &str) -> Result<InterpolationFlags, String> {
+    match s {
+        "linear" => Ok(InterpolationFlags::INTER_LINEAR),
+        "cubic" => Ok(InterpolationFlags::INTER_CUBIC),
+        "area" => Ok(InterpolationFlags::INTER_AREA),
+        "lanczos4" => Ok(InterpolationFlags::INTER_LANCZOS4),
+        _ => Err(format!("无效的插值方式: {s}")),
+    }
 }
 
-#[derive(StructOpt, Debug, Clone)]
-pub struct AddImages {
-    /// Path to an image or folder
-    pub path: String,
-    /// Scan image with these suffixes
-    #[structopt(short, long, default_value = "jpg,png")]
-    pub suffix: String,
-}
-
-#[derive(StructOpt, Debug, Clone)]
-pub struct SearchImage {
-    /// Path to the image to search
-    pub image: String,
-}
-
-#[derive(StructOpt, Debug, Clone)]
-pub struct StartRepl {
-    /// Promot
-    #[structopt(short, long, default_value = "")]
-    pub prompt: String,
-}
-
-#[derive(StructOpt, Debug, Clone)]
-pub struct StartServer {
-    /// Listen address
-    #[structopt(long, default_value = "127.0.0.1:8000")]
-    pub addr: String,
-}
-
-#[derive(StructOpt, Debug, Clone)]
-pub struct MarkAsIndexed {
-    /// Mark feature in [0, max_feature_id) as trained
-    #[structopt(long)]
-    pub max_feature_id: u64,
-}
-
-#[derive(StructOpt, Debug, Clone)]
-pub struct ClearCache {
-    /// Also clear unindexed features
-    #[structopt(long)]
-    pub unindexed: bool,
-}
-
-#[derive(StructOpt, Debug, Clone)]
-pub struct BuildIndex {
-    /// Skip index < start
-    #[structopt(long)]
-    pub start: Option<u64>,
-    /// Skip index >= end
-    #[structopt(long)]
-    pub end: Option<u64>,
-}
-
-#[derive(StructOpt, Debug, Clone)]
-pub enum OutputFormat {
-    Json,
-    Table,
-}
-
-#[derive(StructOpt, Debug, Clone)]
+#[derive(ValueEnum, Debug, Clone, Copy)]
 pub enum ScoreType {
+    /// 威尔逊评分
     Wilson,
+    /// 计数评分
     Count,
-}
-
-impl FromStr for ScoreType {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, String> {
-        match s {
-            "wilson" => Ok(Self::Wilson),
-            "count" => Ok(Self::Count),
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl FromStr for OutputFormat {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "json" => Ok(Self::Json),
-            "table" => Ok(Self::Table),
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl From<&Opts> for Slam3ORB {
-    fn from(opts: &Opts) -> Self {
-        Self::create(
-            opts.orb_nfeatures as i32,
-            opts.orb_scale_factor,
-            opts.orb_nlevels as i32,
-            opts.orb_ini_th_fast as i32,
-            opts.orb_min_th_fast as i32,
-            opts.orb_interpolation,
-            !opts.orb_not_oriented,
-        )
-        .expect("failed to build Slam3Orb")
-    }
-}
-
-impl From<&Opts> for features2d::FlannBasedMatcher {
-    fn from(_opts: &Opts) -> Self {
-        let index_params = core::Ptr::new(flann::IndexParams::from(
-            flann::LshIndexParams::new(6, 12, 1).expect("failed to build LshIndexParams"),
-        ));
-        let search_params = core::Ptr::new(
-            flann::SearchParams::new_1(32, 0.0, true).expect("failed to build SearchParams"),
-        );
-        features2d::FlannBasedMatcher::new(&index_params, &search_params)
-            .expect("failed to build FlannBasedMatcher")
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ConfDir(PathBuf);
-
-impl ConfDir {
-    pub fn path(&self) -> &Path {
-        self.0.as_path()
-    }
-
-    pub fn database(&self) -> PathBuf {
-        self.0.join("database")
-    }
-
-    pub fn index(&self) -> PathBuf {
-        self.0.join("index")
-    }
-
-    pub fn version(&self) -> PathBuf {
-        self.0.join("version")
-    }
-}
-
-impl FromStr for ConfDir {
-    type Err = Infallible;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(PathBuf::from(s)))
-    }
 }

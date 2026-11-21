@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT vector.id as id, vector, total_vector_count\n        FROM vector\n        JOIN vector_stats ON vector.id = vector_stats.id\n        WHERE vector_stats.indexed = 0\n        LIMIT ? OFFSET ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "vector",
+        "ordinal": 1,
+        "type_info": "Blob"
+      },
+      {
+        "name": "total_vector_count",
+        "ordinal": 2,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d5b68acb50040fc9d352c5f2967918cadcafa357c81664b41339e55fd5c866d2"
+}

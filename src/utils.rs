@@ -1,144 +1,66 @@
 use std::fs::File;
-use std::io::{Read, Write};
-use std::path::Path;
-use std::time::{Duration, Instant};
+use std::io::Read;
 
-use crate::slam3_orb::Slam3ORB;
 use anyhow::Result;
-use blake3::Hash;
-use dashmap::DashMap;
-use opencv::features2d;
-use opencv::highgui;
-use opencv::imgcodecs;
-use opencv::prelude::*;
-use opencv::types;
-use opencv::{core, imgproc};
+use axum_typed_multipart::TryFromField;
+use clap::ValueEnum;
+use indicatif::ProgressStyle;
+use opencv::core::*;
+use opencv::{imgcodecs, imgproc};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
+use crate::dhash::d_hash;
+use crate::orb::Slam3ORB;
+
+/// 检测并计算特征点
 pub fn detect_and_compute(
     orb: &mut Slam3ORB,
-    image: &dyn core::ToInputArray,
-) -> Result<(types::VectorOfKeyPoint, Mat)> {
+    image: &impl ToInputArray,
+) -> opencv::Result<(Vec<KeyPoint>, Vec<[u8; 32]>)> {
     let mask = Mat::default();
-    let lap = types::VectorOfi32::from(vec![0, 0]);
-    let mut kps = types::VectorOfKeyPoint::new();
+    let mut kps = Vector::<KeyPoint>::new();
     let mut des = Mat::default();
-    orb.detect_and_compute(image, &mask, &mut kps, &mut des, &lap)?;
+    orb.detect_and_compute(image, &mask, &mut kps, &mut des)?;
+    let kps = kps.to_vec();
+    let des = des.data_bytes()?;
+    let des = des.chunks_exact(32).map(|chunk| chunk.try_into().unwrap()).collect();
     Ok((kps, des))
 }
 
-pub fn imread<S: AsRef<str>>(filename: S) -> Result<Mat> {
-    let mut img = imgcodecs::imread(filename.as_ref(), imgcodecs::IMREAD_GRAYSCALE)?;
-    if img.cols() > 1920 || img.rows() > 1080 {
-        img = adjust_image_size(&img, 1920, 1080)?;
+pub fn imdecode(buf: &[u8], (height, width): (i32, i32)) -> opencv::Result<Mat> {
+    let mat = Mat::from_slice(buf)?;
+    let mut img = imgcodecs::imdecode(&mat, imgcodecs::IMREAD_GRAYSCALE)?;
+    if img.cols() > width && img.rows() > height {
+        img = adjust_image_size(img, (height, width))?;
     }
     Ok(img)
 }
 
-pub fn imshow(winname: &str, mat: &dyn core::ToInputArray) -> Result<()> {
-    highgui::imshow(winname, mat)?;
-    while highgui::get_window_property(
-        winname,
-        highgui::WindowPropertyFlags::WND_PROP_FULLSCREEN as i32,
-    )? >= 0.0
-    {
-        highgui::wait_key(50)?;
+pub fn imread<S: AsRef<str>>(filename: S, (height, width): (i32, i32)) -> opencv::Result<Mat> {
+    let mut img = imgcodecs::imread(filename.as_ref(), imgcodecs::IMREAD_GRAYSCALE)?;
+    if img.cols() > width && img.rows() > height {
+        img = adjust_image_size(img, (height, width))?;
     }
-    Ok(())
+    Ok(img)
 }
 
-pub fn imwrite(filename: &str, img: &dyn core::ToInputArray) -> Result<bool> {
-    let flags = types::VectorOfi32::new();
-    Ok(imgcodecs::imwrite(filename, img, &flags)?)
-}
-
-// TODO: 对于长图，应该要增加特征点数量
-pub fn adjust_image_size(img: &Mat, width: i32, height: i32) -> Result<Mat> {
-    if img.rows() <= height || img.cols() <= width {
-        return Ok(img.clone());
+// 在长宽比例中，选择最大的进行缩放
+pub fn adjust_image_size(img: Mat, (height, width): (i32, i32)) -> opencv::Result<Mat> {
+    let scale = (width as f64 / img.cols() as f64).max(height as f64 / img.rows() as f64);
+    if scale >= 1. {
+        return Ok(img);
     }
-    let (ow, oh) = (img.cols() as f64, img.rows() as f64);
-    let scale = (height as f64 / oh).min(width as f64 / ow);
     let mut output = Mat::default();
     imgproc::resize(
-        img,
+        &img,
         &mut output,
-        core::Size::default(),
+        Size::default(),
         scale,
         scale,
         imgproc::InterpolationFlags::INTER_AREA as i32,
     )?;
     Ok(output)
-}
-
-pub fn draw_keypoints(
-    image: &dyn core::ToInputArray,
-    keypoints: &types::VectorOfKeyPoint,
-) -> Result<Mat> {
-    let mut output = core::Mat::default();
-    features2d::draw_keypoints(
-        image,
-        keypoints,
-        &mut output,
-        core::Scalar::all(-1.0),
-        features2d::DrawMatchesFlags::DEFAULT,
-    )?;
-    Ok(output)
-}
-
-pub fn draw_matches_knn(
-    img1: &dyn core::ToInputArray,
-    keypoints1: &types::VectorOfKeyPoint,
-    img2: &dyn core::ToInputArray,
-    keypoints2: &types::VectorOfKeyPoint,
-    matches1to2: &types::VectorOfVectorOfDMatch,
-    matches_mask: &types::VectorOfVectorOfi8,
-) -> Result<Mat> {
-    let mut output = core::Mat::default();
-    features2d::draw_matches_knn(
-        img1,
-        keypoints1,
-        img2,
-        keypoints2,
-        matches1to2,
-        &mut output,
-        core::Scalar::from((0., 255., 0.)),
-        core::Scalar::from((255., 0., 0.)),
-        matches_mask,
-        features2d::DrawMatchesFlags::DEFAULT,
-    )?;
-    Ok(output)
-}
-
-#[derive(Debug, Default)]
-pub struct TimeMeasure(pub DashMap<String, Duration>);
-
-impl TimeMeasure {
-    pub fn new() -> Self {
-        Self(DashMap::new())
-    }
-
-    pub fn measure<F, R>(&self, key: &str, f: F) -> R
-    where
-        F: FnOnce() -> R,
-    {
-        let start = Instant::now();
-        let r = f();
-        *self.0.entry(key.to_owned()).or_insert(Duration::default()) += Instant::now() - start;
-        r
-    }
-}
-
-pub fn read_line(prompt: &str) -> Result<String> {
-    print!("{}", prompt);
-    std::io::stdout().flush()?;
-    let v = std::io::stdin()
-        .bytes()
-        .take_while(|c| c.as_ref().ok() != Some(&b'\n'))
-        .collect::<Result<Vec<_>, _>>()?;
-    if v.is_empty() {
-        anyhow::bail!("EOF");
-    }
-    Ok(String::from_utf8(v)?.trim().to_owned())
 }
 
 /// 威尔逊得分
@@ -157,9 +79,70 @@ pub fn wilson_score(scores: &[f32]) -> f32 {
         / (1. + z.powi(2) / count)
 }
 
-pub fn hash_file<P: AsRef<Path>>(path: P) -> Result<Hash> {
-    let mut file = File::open(path)?;
-    let mut data = vec![];
-    file.read_to_end(&mut data)?;
-    Ok(blake3::hash(&data))
+pub fn pb_style() -> ProgressStyle {
+    ProgressStyle::default_bar()
+        .template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}",
+        )
+        .unwrap()
+        .progress_chars("#>-")
+}
+
+pub fn pb_style_speed() -> ProgressStyle {
+    ProgressStyle::default_bar()
+        .template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({per_sec}) {msg}",
+        )
+        .unwrap()
+        .progress_chars("#>-")
+}
+
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, ValueEnum, ToSchema, TryFromField, Serialize, Deserialize,
+)]
+pub enum ImageHash {
+    /// 使用 blake3 哈希算法，长度 32 字节
+    #[schema(rename = "blake3")]
+    Blake3,
+    /// 使用 dhash 哈希算法，长度 8 字节
+    #[schema(rename = "dhash")]
+    Dhash,
+}
+
+impl ImageHash {
+    /// 对一个图片文件进行哈希，返回哈希值
+    pub fn hash_file(&self, path: &str) -> Result<Vec<u8>> {
+        match self {
+            Self::Blake3 => {
+                let mut file = File::open(path)?;
+                let mut data = vec![];
+                file.read_to_end(&mut data)?;
+                Ok(blake3::hash(&data).as_bytes().to_vec())
+            }
+            Self::Dhash => {
+                let img = imgcodecs::imread(path, imgcodecs::IMREAD_GRAYSCALE)?;
+                let hash = d_hash(&img)?;
+                Ok(hash.to_vec())
+            }
+        }
+    }
+
+    /// 对一个图片的字节序列进行哈希，返回解码后的图片和哈希值
+    pub fn hash_bytes(&self, data: &[u8]) -> Result<(Option<Mat>, Vec<u8>)> {
+        match self {
+            Self::Blake3 => Ok((None, blake3::hash(data).as_bytes().to_vec())),
+            Self::Dhash => {
+                let mat = Mat::from_slice(data)?;
+                let img = imgcodecs::imdecode(&mat, imgcodecs::IMREAD_GRAYSCALE)?;
+                let hash = d_hash(&img)?;
+                Ok((Some(img), hash.to_vec()))
+            }
+        }
+    }
+}
+
+impl Default for ImageHash {
+    fn default() -> Self {
+        Self::Blake3
+    }
 }
